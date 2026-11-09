@@ -30,5 +30,8 @@
   "state_path": "bsc_vol_state.json"
  },
  "fresh_bypass_minutes": 10,
- "eval_per_cycle": 2
+ "eval_per_cycle": 2,
+ "dex_refresh_seconds": 45,
+ "prefilter_batch": 90,
+ "min_probe_age_seconds": 120
 }
