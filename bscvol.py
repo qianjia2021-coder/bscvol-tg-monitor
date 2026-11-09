@@ -394,6 +394,18 @@ async def tg_ensure_target(client, functions, cfg, state):
 
 
 async def tg_send(client, functions, cfg, state, text):
+    bot_token = (cfg.get("bot_token") or os.environ.get("VOL_BOT_TOKEN") or "").strip()
+    if bot_token:
+        res = http_json(
+            "https://api.telegram.org/bot%s/sendMessage" % bot_token,
+            {"chat_id": state.get("target_id") or cfg["telegram"].get("chat_id"),
+             "text": text, "parse_mode": "html", "disable_web_page_preview": True},
+            timeout=25, method="POST")
+        if not res.get("ok"):
+            raise RuntimeError("Bot 发送失败: %s" % str(res)[:200])
+        return None
+    if client is None:
+        raise RuntimeError("推送通道不可用（无 Bot Token 且用户会话失效）")
     entity = await tg_ensure_target(client, functions, cfg, state)
     await client.send_message(entity, text, parse_mode="html", link_preview=False)
     return entity
@@ -520,17 +532,31 @@ async def run_local():
     cfg = load_config()
     state = load_state()
     chain = Chain(cfg)
-    client, functions = tg_client(cfg, os.path.join(HERE, cfg["telegram"]["session"]))
-    await client.start()
-    me = await client.get_me()
-    entity = await tg_ensure_target(client, functions, cfg, state)
+    bot = (cfg.get("bot_token") or os.environ.get("VOL_BOT_TOKEN") or "").strip()
+    client = functions = None
+    if bot:
+        if not state.get("target_id"):
+            state["target_id"] = cfg["telegram"].get("chat_id")
+        tag = "Bot 模式"
+    else:
+        client, functions = tg_client(cfg, os.path.join(HERE, cfg["telegram"]["session"]))
+        try:
+            await client.start()
+            me = await client.get_me()
+            entity = await tg_ensure_target(client, functions, cfg, state)
+            tag = "账号=%s 目标群=%s" % (getattr(me, "username", me.id),
+                                       getattr(entity, "title", entity.id))
+        except Exception as e:
+            log.error("用户会话不可用（%s: %s），本轮只扫描不推送", type(e).__name__, e)
+            client = functions = None
+            tag = "扫描模式（推送通道不可用）"
     try:
         merged = sync_state_down(cfg, state)
         log.info("云端去重状态合并 %d 条", merged)
     except Exception as e:
         log.warning("拉取云端状态失败: %s", e)
     save_state(state)
-    log.info("启动：账号=%s 目标群=%s", getattr(me, "username", me.id), getattr(entity, "title", entity.id))
+    log.info("启动：%s", tag)
 
     last_hb = 0.0
     while True:
@@ -585,7 +611,11 @@ async def run_local():
                              info.get("m5") or 0, len(info.get("minutes") or {}))
                     if hit and not is_pushed(state, k):
                         text = build_message(k, hit, info, cfg)
-                        await tg_send(client, functions, cfg, state, text)
+                        try:
+                            await tg_send(client, functions, cfg, state, text)
+                        except Exception as e:
+                            log.warning("推送失败 %s: %s（保留待推，下轮重试）", k, e)
+                            continue
                         mark_pushed(state, k, hit)
                         save_state(state)
                         log.info("已推送 %s 窗口 %s", k,
