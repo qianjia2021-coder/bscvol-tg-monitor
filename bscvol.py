@@ -447,7 +447,7 @@ async def tg_send(client, functions, cfg, state, text):
     bot_token = (cfg.get("bot_token") or os.environ.get("VOL_BOT_TOKEN") or "").strip()
     if bot_token:
         res = bot_api(bot_token, "sendMessage",
-                      {"chat_id": state.get("target_id") or cfg["telegram"].get("chat_id"),
+                      {"chat_id": cfg["telegram"].get("chat_id") or state.get("target_id"),
                        "text": text, "parse_mode": "html", "disable_web_page_preview": "true"})
         if not res.get("ok"):
             raise RuntimeError("Bot 发送失败: %s" % str(res.get("description"))[:200])
@@ -524,7 +524,7 @@ def sync_state_down(cfg, state):
         if k not in local:
             local[k] = v
             n += 1
-    if not state.get("target_id") and remote.get("target_id"):
+    if not state.get("target_id") and remote.get("target_id") and not cfg["telegram"].get("chat_id"):
         state["target_id"] = remote["target_id"]
     return n
 
@@ -583,9 +583,8 @@ async def run_local():
     bot = (cfg.get("bot_token") or os.environ.get("VOL_BOT_TOKEN") or "").strip()
     client = functions = None
     if bot:
-        if not state.get("target_id"):
-            state["target_id"] = cfg["telegram"].get("chat_id")
-        tag = "Bot 模式"
+        state["target_id"] = cfg["telegram"].get("chat_id")   # 以配置为准，避免被远端旧值覆盖
+        tag = "Bot 模式 chat_id=%s" % state["target_id"]
     else:
         client, functions = tg_client(cfg, os.path.join(HERE, cfg["telegram"]["session"]))
         try:
@@ -660,7 +659,8 @@ async def run_local():
                         cands[k]["next_check"] = now + 12
                         continue
                     budget -= 1
-                    cands[k]["next_check"] = now + 20
+                    # 预筛命中的高频复查；Gecko 还没收录的新币放慢到 1 分钟一次
+                    cands[k]["next_check"] = now + (20 if m5.get(k, 0) >= pf else 60)
                     log.info("评估候选 %s m5=%.0f age=%.0f分钟", k, m5.get(k, 0),
                              (now - int(cands[k]["found"])) / 60.0)
                     try:
