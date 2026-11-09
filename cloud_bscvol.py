@@ -36,17 +36,34 @@ def hb_writeback(hb_keep, hb_current):
     云端接管期间本机可能重启并写下新心跳；若直接写回启动时抓到的旧值，就会把
     本机的新心跳盖掉，外部触发器（按 hb 判断本机是否在线）会继续每 2 分钟 dispatch，
     形成「云端反复接管 + 本机心跳被反复写旧」的自激循环。
+    与内核 newer_hb 共用一套「只增不减」语义，避免两处规则漂移。
     """
-    if not hb_current:
-        return hb_keep
-    if not hb_keep:
-        return hb_current
+    return bscvol.newer_hb(hb_keep, hb_current)
+
+
+def writeback_state(cfg, token, state, hb_keep, log=None):
+    """云端收尾：心跳只增不减，整文件写回前先与远端合并 pushed。
+
+    只修 hb 是不够的 —— 云端/本机都把自己内存里的 pushed 全量覆盖回远端，
+    会抹掉对端在运行期间新增的去重记录，同一命中就会被推两次。
+    """
+    remote_end = None
+    hb_final = hb_keep
     try:
-        if bscvol.parse_iso(hb_current) >= bscvol.parse_iso(hb_keep):
-            return hb_current
-        return hb_keep
-    except Exception:
-        return hb_current
+        remote_end, _ = bscvol.gh_get(cfg, token, cfg["github"]["state_path"])
+        hb_final = hb_writeback(hb_keep, (remote_end or {}).get("hb"))
+    except Exception as e:
+        if log:
+            log.warning("收尾读远端心跳失败（沿用启动值）: %s", e)
+    # 本机已恢复心跳时不要把身份写成 cloud，避免短暂误导运维判断
+    identity = "cloud"
+    if local_resumed(hb_final, time.time(), cfg.get("takeover_after", 600)):
+        identity = (remote_end or {}).get("identity") or "local"
+    bscvol.gh_put_merged(
+        cfg, token, cfg["github"]["state_path"],
+        {"hb": hb_final, "identity": identity,
+         "pushed": state.get("pushed", {}), "target_id": state.get("target_id")},
+        "bscvol cloud state [skip ci]")
 
 
 def local_resumed(hb_iso, now_ts, takeover_after):
@@ -243,17 +260,8 @@ async def main():
 
     bscvol.save_state(state)
     if token:
-        hb_final = hb_keep
         try:
-            remote_end, _ = bscvol.gh_get(cfg, token, cfg["github"]["state_path"])
-            hb_final = hb_writeback(hb_keep, (remote_end or {}).get("hb"))
-        except Exception as e:
-            log.warning("收尾读远端心跳失败（沿用启动值）: %s", e)
-        try:
-            bscvol.gh_put(cfg, token, cfg["github"]["state_path"],
-                          {"hb": hb_final, "identity": "cloud",
-                           "pushed": state["pushed"], "target_id": state.get("target_id")},
-                          "bscvol cloud state [skip ci]")
+            writeback_state(cfg, token, state, hb_keep, log)
         except Exception as e:
             log.warning("写回云端状态失败: %s", e)
     print("DONE: pushed=%d candidates=%d hot=%d stale=%d rate_limited=%s"
