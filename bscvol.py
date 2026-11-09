@@ -133,10 +133,20 @@ def candidate_tier(cand, now, cfg):
     3 新币(10 分钟内) + 未收录 —— 兜底
     4 既不热也不新             —— 只等下一轮预筛，不占用 Gecko 配额
     5 Gecko 已收录但池子全老   —— 超出币龄上限，查了也不会成立，不占配额
+
+    剪枝用「历史峰值 m5_peak」而非当前 m5：量能爆发后回落的新币，
+    当前 m5 可能已掉到门槛以下，但爆发窗口仍可能落在回看范围内，
+    用当前值会把它误判成「永远不可能命中」而漏推。
+
+    注：曾尝试增加「数学上不可能命中」剪枝层（m5 峰值都到不了一根
+    分钟线的量就不占配额），但实测 Gecko 配额占用仅 9-14%，
+    根本不是瓶颈；剪枝反而让复查流量上升约 36%（净损失）。
+    真正影响命中的是阈值与市场量级的匹配，见 README。
     """
     prefilter = float(cfg.get("prefilter_m5_usd", 50000))
     bypass = int(cfg.get("fresh_bypass_minutes", 10)) * 60
-    m5 = float(cand.get("m5") or 0)
+    # 峰值优先：m5_peak 记录该币历史上观测到的最大 m5
+    m5 = max(float(cand.get("m5") or 0), float(cand.get("m5_peak") or 0))
     hot = m5 >= prefilter
     fresh = (now - int(cand.get("found", now))) <= bypass
     state = cand.get("gecko_state")
@@ -199,10 +209,35 @@ def load_state(path=STATE_FILE):
     if os.path.exists(path):
         try:
             with open(path, encoding="utf-8") as f:
-                return json.load(f)
+                st = json.load(f)
+            backfill_m5_peak(st)
+            return st
         except Exception:
             logging.warning("state.json 损坏，按空状态重建")
     return {"pushed": {}, "candidates": {}, "last_block": 0, "target_id": None}
+
+
+def backfill_m5_peak(state):
+    """为老 state 里的候选补 m5_peak 初值。
+
+    m5_peak 记录该币历史上观测到的最大 5 分钟成交额，用途是
+    「量能爆发后回落」的新币不被误判为永远不可能命中：
+    当前 m5 可能已掉到门槛以下，但爆发窗口仍可能落在回看范围内。
+
+    老 state 没有这个字段，用 DexScreener 的 m5 作初值即可 ——
+    它在实测中是 Gecko 的保守下界，偏小只是让剪枝更保守，不会误杀。
+    Gecko 评估后会自动回填更大的真实值。
+    """
+    cands = state.get("candidates") or {}
+    n = 0
+    for k, v in cands.items():
+        if not isinstance(v, dict):
+            continue
+        if v.get("m5_peak") is None:
+            v["m5_peak"] = float(v.get("m5") or 0)
+            n += 1
+    if n:
+        logging.info("回填 m5_peak 初值 %d 个候选", n)
 
 
 def save_state(state, path=STATE_FILE):
@@ -444,9 +479,19 @@ def parse_iso(ts):
         return None
 
 
-def evaluate_token(token, cfg, now_ts=None, deep_minutes=10, ignore_age=False):
-    """返回 (hit, info)；hit 为 detect 结果，info 为展示用信息"""
+def evaluate_token(token, cfg, now_ts=None, deep_minutes=None, ignore_age=False,
+                   m5_peak=None):
+    """返回 (hit, info)；hit 为 detect 结果，info 为展示用信息
+
+    deep_minutes: 回看多少根分钟线。None 时取 config 的 deep_minutes（默认 10）。
+      必须大于「发现延迟 + 判定窗口」，否则爆发窗口会滑出回看范围造成漏推。
+    m5_peak: 该币历史观测到的最大 5 分钟成交额。用于避免
+      「量能爆发后回落」的新币被当前的 low_m5 提前返回挡掉 —— 爆发窗口
+      可能仍落在 deep_minutes 回看范围内，必须照常取分钟线。
+    """
     now_ts = now_ts or int(time.time())
+    if deep_minutes is None:
+        deep_minutes = int(cfg.get("deep_minutes", 10))
     max_age = cfg["max_age_minutes"] * 60
     pools = gecko_pools(token)
     if not pools:
@@ -471,8 +516,13 @@ def evaluate_token(token, cfg, now_ts=None, deep_minutes=10, ignore_age=False):
         # Gecko 收录的池子全部超过币龄上限 —— 判定不可能成立
         return None, {"state": "all_pools_old", "pool_count": len(pools)}
 
-    if sum(p["m5"] for p in live) < cfg["prefilter_m5_usd"]:
-        return None, {"state": "low_m5", "m5": sum(p["m5"] for p in live),
+    # low_m5 提前返回：只在「历史上也从没到过门槛」时才放弃。
+    # 若该币曾爆发过（m5_peak 够高）而此刻回落，仍要照常取分钟线，
+    # 否则爆发窗口会被误杀 —— 这是真实的漏推路径。
+    live_m5 = sum(p["m5"] for p in live)
+    peak = max(live_m5, float(m5_peak or 0))
+    if peak < cfg["prefilter_m5_usd"]:
+        return None, {"state": "low_m5", "m5": live_m5,
                       "pool_count": len(live)}
 
     top = max(p["reserve"] for p in live)
@@ -899,6 +949,10 @@ async def run_local():
                         if k in m5:               # 只更新查成功的，查失败的保留旧值下轮重来
                             cands[k]["dex_at"] = now
                             cands[k]["m5"] = float(m5[k])
+                            # 记录历史峰值：量能爆发后可能回落，
+                            # 若只看当前值，爆发窗口会被误判成「不可能命中」而漏推
+                            if float(m5[k]) > float(cands[k].get("m5_peak") or 0):
+                                cands[k]["m5_peak"] = float(m5[k])
                             ok += 1
                     hot_count = sum(1 for k in window
                                     if float(cands[k].get("m5") or 0) >= cfg["prefilter_m5_usd"])
@@ -914,9 +968,9 @@ async def run_local():
                 for k in due:
                     c = cands[k]
                     tier = candidate_tier(c, now, cfg)
-                    if tier >= 4:
+                    if tier >= 4 and tier not in (6, 7):
                         # tier4 既不热也不新；tier5 池子全老（超币龄上限）。
-                        # 两者都不占 Gecko 配额，等下一轮预筛。
+                        # 都不占 Gecko 配额，等下一轮预筛。
                         # 保留自身退避节奏（未收录的候选退避可能已达 900s），
                         # 不能一律压回 120s —— 那会打断退避，让未收录的新币
                         # 每 2 分钟就重查一次 Gecko，正是配额空烧的根源。
@@ -931,19 +985,29 @@ async def run_local():
                         c["next_check"] = now + min(30, max(5, probe_min_age - age))
                         continue
                     budget -= 1
-                    hot = float(c.get("m5") or 0) >= cfg["prefilter_m5_usd"]
+                    hot = max(float(c.get("m5") or 0),
+                              float(c.get("m5_peak") or 0)) >= cfg["prefilter_m5_usd"]
                     fresh = age <= bypass
                     c["next_check"] = now + (20 if hot else 60)
                     log.info("评估候选 %s tier=%d m5=%.0f age=%.0f分钟",
                              k, tier, float(c.get("m5") or 0), age / 60.0)
                     try:
                         hit, info = evaluate_token(k, cfg, now,
-                                                   ignore_age=bool(c.get("manual")))
+                                                   ignore_age=bool(c.get("manual")),
+                                                   m5_peak=c.get("m5_peak"))
                     except Exception as e:
                         log.warning("评估失败 %s: %s", k, e)
                         continue
                     log.info("评估 %s -> %s m5=%.0f 分钟数=%d", k, info.get("state"),
                              info.get("m5") or 0, len(info.get("minutes") or {}))
+                    # Gecko 的 m5 比 DexScreener 准（按池子聚合，更贴近链上）。
+                    # 必须回写：否则 tier 分层永远用 DexScreener 的旧值，
+                    # Gecko 已收录且 m5 很高的币会因 dex_m5=0 落到 tier4 永不评估。
+                    g_m5 = float(info.get("m5") or 0)
+                    if g_m5 > float(c.get("m5") or 0):
+                        c["m5"] = g_m5
+                    if g_m5 > float(c.get("m5_peak") or 0):
+                        c["m5_peak"] = g_m5
                     if info.get("state") == "no_pool":
                         # 未收录：退避重试，避免每轮白烧一次配额
                         step = int(c.get("backoff_step", 0))
