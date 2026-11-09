@@ -156,6 +156,17 @@ def next_backoff(step):
     return NO_POOL_BACKOFF[step]
 
 
+def tier4_wait(cand):
+    """tier4 候选（不占 Gecko 配额）的下次检查间隔。
+
+    未被 Gecko 收录的候选要沿用自身退避节奏；若一律压回 120 秒，
+    退避会被打断，未收录的新币就会每 2 分钟重查一次 Gecko —— 正是配额空烧的根源。
+    """
+    if cand.get("gecko_state") == "no_pool":
+        return next_backoff(cand.get("backoff_step", 0))
+    return 120
+
+
 def min_probe_age(cfg):
     """判定至少需要 need 个完整自然分钟，早于此年龄去查必然查不到，白耗配额"""
     need = int(cfg.get("need_consecutive", 2))
@@ -809,8 +820,11 @@ async def run_local():
                     c = cands[k]
                     tier = candidate_tier(c, now, cfg)
                     if tier == 4:
-                        # 既不热也不新：不占 Gecko 配额，等下一轮预筛
-                        c["next_check"] = now + 120
+                        # 既不热也不新：不占 Gecko 配额，等下一轮预筛。
+                        # 保留自身退避节奏（未收录的候选退避可能已达 900s），
+                        # 不能一律压回 120s —— 那会打断退避，让未收录的新币
+                        # 每 2 分钟就重查一次 Gecko，正是配额空烧的根源。
+                        c["next_check"] = now + tier4_wait(c)
                         continue
                     if budget <= 0:
                         c["next_check"] = now + 12
