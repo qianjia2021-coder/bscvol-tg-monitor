@@ -1,0 +1,40 @@
+name: bsc-vol-monitor
+
+on:
+  schedule:
+    # 错峰，避开整点/整五分
+    - cron: "2,7,12,17,22,27,32,37,42,47,52,57 * * * *"
+  workflow_dispatch:
+    inputs:
+      selftest:
+        description: "自检：只验证云端登录与推送链路"
+        required: false
+        default: "0"
+
+permissions: write-all
+
+concurrency:
+  group: bsc-vol-monitor
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install --quiet telethon pysocks
+
+      - name: Run takeover check
+        env:
+          VOL_TG_API_ID: ${{ secrets.VOL_TG_API_ID }}
+          VOL_TG_API_HASH: ${{ secrets.VOL_TG_API_HASH }}
+          VOL_TG_STRING_SESSION: ${{ secrets.VOL_TG_STRING_SESSION }}
+          VOL_SELFTEST: ${{ github.event.inputs.selftest || '0' }}
+        run: python cloud_bscvol.py
