@@ -252,6 +252,19 @@ def detect_system_proxy():
 
 _opener = None
 _opener_proxy = None
+_direct_opener = None
+
+
+def direct_opener():
+    """真正不走任何代理的 opener（屏蔽环境变量里的 HTTP_PROXY 等）。
+
+    实测：GitHub API 直连 0.7s 可用，而 Gecko / DexScreener 直连必然超时
+    （DNS 污染，见 README），所以只有 GitHub 相关请求适合走这个降级路径。
+    """
+    global _direct_opener
+    if _direct_opener is None:
+        _direct_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return _direct_opener
 
 
 def opener(proxy=None):
@@ -299,7 +312,13 @@ def bot_api(token, method, payload=None, timeout=25, tries=3):
     raise last
 
 
-def http_json(url, headers=None, data=None, timeout=15, tries=3, proxy=None, method=None):
+def http_json(url, headers=None, data=None, timeout=15, tries=3, proxy=None, method=None,
+              allow_direct=False):
+    """allow_direct=True 时，代理链路失败会再试一次直连。
+
+    仅对实测直连可用的目标（如 GitHub API）启用；Gecko / DexScreener
+    因 DNS 污染直连必然超时，开了反而更慢。
+    """
     h = {"Accept": "application/json", "User-Agent": UA, "Accept-Encoding": "gzip"}
     if headers:
         h.update(headers)
@@ -323,6 +342,14 @@ def http_json(url, headers=None, data=None, timeout=15, tries=3, proxy=None, met
         except Exception as e:
             last = e
             time.sleep(0.8 + attempt)
+    # 代理链路走不通时，最后再试一次直连（仅对允许直连的目标）
+    if allow_direct:
+        try:
+            req = urllib.request.Request(url, data=body, headers=h, method=method)
+            with direct_opener().open(req, timeout=timeout) as r:
+                return json.loads(_read_body(r))
+        except Exception as e:
+            last = e
     raise last
 
 
@@ -582,7 +609,8 @@ def gh_repo(cfg):
 def gh_get_raw(cfg, token, path):
     """读取仓库中的任意文件，返回 (文本, sha)；文件不存在返回 (None, None)"""
     try:
-        j = http_json(f"{gh_repo(cfg)}/{path}", headers=gh_headers(cfg, token), timeout=20)
+        j = http_json(f"{gh_repo(cfg)}/{path}", headers=gh_headers(cfg, token), timeout=20,
+                      allow_direct=True)
         return base64.b64decode(j["content"]).decode("utf-8"), j["sha"]
     except urllib.error.HTTPError as e:
         if e.code == 404:
@@ -615,7 +643,7 @@ def gh_put(cfg, token, path, obj, message):
     if sha:
         body["sha"] = sha
     j = http_json(f"{gh_repo(cfg)}/{path}", headers=gh_headers(cfg, token), data=body,
-                  timeout=25, tries=3, method="PUT")
+                  timeout=25, tries=3, method="PUT", allow_direct=True)
     return j.get("commit", {}).get("sha")
 
 
