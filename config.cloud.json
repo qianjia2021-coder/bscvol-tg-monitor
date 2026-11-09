@@ -18,7 +18,8 @@
   "api_hash": "",
   "session": "cloud.session",
   "invite_hash": "0NCSpGbGf_MyNWU1",
-  "group_title": "BSC推送群"
+  "group_title": "BSC推送群",
+  "chat_id": -5194908956
  },
  "tg_proxy": null,
  "github": {
@@ -27,5 +28,13 @@
   "branch": "main",
   "token_env": "GITHUB_TOKEN",
   "state_path": "bsc_vol_state.json"
- }
+ },
+ "fresh_bypass_minutes": 10,
+ "eval_per_cycle": 2,
+ "dex_refresh_seconds": 45,
+ "prefilter_batch": 90,
+ "min_probe_age_seconds": 120,
+ "cloud_keepalive": true,
+ "cloud_keepalive_max_gap": 900,
+ "deep_minutes": 30
 }
