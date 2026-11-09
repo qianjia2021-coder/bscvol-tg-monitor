@@ -49,6 +49,9 @@ async def main():
             state.setdefault("pushed", {}).update(remote.get("pushed") or {})
             if remote.get("target_id"):
                 state["target_id"] = remote["target_id"]
+    # Bot 模式以配置里的 chat_id 为准（用户会话的 id 形态不同）
+    if (cfg.get("bot_token") or os.environ.get("VOL_BOT_TOKEN") or "").strip():
+        state["target_id"] = cfg["telegram"].get("chat_id") or state.get("target_id")
 
     age = None
     if hb_keep:
