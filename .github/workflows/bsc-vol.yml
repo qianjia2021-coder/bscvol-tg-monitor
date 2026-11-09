@@ -36,5 +36,6 @@ jobs:
           VOL_TG_API_ID: ${{ secrets.VOL_TG_API_ID }}
           VOL_TG_API_HASH: ${{ secrets.VOL_TG_API_HASH }}
           VOL_TG_STRING_SESSION: ${{ secrets.VOL_TG_STRING_SESSION }}
+          VOL_BOT_TOKEN: ${{ secrets.VOL_BOT_TOKEN }}
           VOL_SELFTEST: ${{ github.event.inputs.selftest || '0' }}
         run: python cloud_bscvol.py
