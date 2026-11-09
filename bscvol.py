@@ -266,11 +266,29 @@ class Chain:
 
 # ---------------------------------------------------------------- Gecko
 GECKO = "https://api.geckoterminal.com/api/v2/networks/bsc"
+_GECKO_GAP = {"t": 0.0}
+
+
+def gecko_get(url, timeout=18):
+    """全局限速：两次请求至少间隔 2.5 秒；遇 429 冷却 25 秒再试一次"""
+    for attempt in range(2):
+        wait = 2.5 - (time.time() - _GECKO_GAP["t"])
+        if wait > 0:
+            time.sleep(wait)
+        _GECKO_GAP["t"] = time.time()
+        try:
+            return http_json(url, timeout=timeout, tries=1)
+        except urllib.error.HTTPError as e:
+            if e.code == 429 and attempt == 0:
+                logging.warning("Gecko 限流，冷却 25 秒")
+                time.sleep(25)
+                continue
+            raise
 
 
 def gecko_pools(token):
     try:
-        j = http_json(f"{GECKO}/tokens/{token}/pools", timeout=18)
+        j = gecko_get(f"{GECKO}/tokens/{token}/pools")
     except urllib.error.HTTPError as e:
         if e.code == 404:      # 新币尚未被 Gecko 收录
             return []
@@ -283,7 +301,7 @@ def gecko_minutes(pool_id, limit=10, before_ts=None):
     url = (f"{GECKO}/pools/{pid}/ohlcv/minute?aggregate=1&limit={limit}&currency=usd")
     if before_ts:
         url += f"&before_timestamp={int(before_ts)}"
-    j = http_json(url, timeout=18)
+    j = gecko_get(url)
     out = []
     for c in (j.get("data", {}).get("attributes", {}) or {}).get("ohlcv_list", []) or []:
         out.append((int(c[0]), float(c[5] or 0)))
