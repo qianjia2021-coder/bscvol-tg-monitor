@@ -718,16 +718,73 @@ def gh_get(cfg, token, path):
         return None, None
 
 
-def gh_put(cfg, token, path, obj, message):
+def gh_put(cfg, token, path, obj, message, sha=None):
+    """写仓库文件。sha 由调用方传入时直接用它做并发校验，省掉一次 GET。"""
     content = base64.b64encode(
         json.dumps(obj, ensure_ascii=False, indent=1).encode("utf-8")).decode()
     body = {"message": message, "content": content, "branch": cfg["github"].get("branch", "main")}
-    _, sha = gh_get(cfg, token, path)
+    if sha is None:
+        _, sha = gh_get(cfg, token, path)
     if sha:
         body["sha"] = sha
     j = http_json(f"{gh_repo(cfg)}/{path}", headers=gh_headers(cfg, token), data=body,
                   timeout=25, tries=3, method="PUT", allow_direct=True)
     return j.get("commit", {}).get("sha")
+
+
+def newer_hb(a, b):
+    """两个心跳 ISO 取较新者；都为空返回 None。共享状态的心跳只增不减。"""
+    if not a:
+        return b
+    if not b:
+        return a
+    ta, tb = parse_iso(a), parse_iso(b)
+    if ta is None or tb is None:
+        return b                      # 解析不了时保守采用「远端当前值」
+    return a if ta >= tb else b
+
+
+def merge_shared_state(remote, incoming):
+    """写回 bsc_vol_state.json 前，把本端快照与远端当前值合并。
+
+    这个文件是整文件覆盖写入，本机与云端各持一份内存快照（sync_state_down
+    只在启动时合并一次）。任何一端直接写自己的快照，都会抹掉对端在运行期间
+    新增的 pushed（同一命中被重复推送），或把 hb 写旧（外部触发器反复 dispatch）。
+    合并规则：pushed 只增不减、hb 只增不减、identity 跟随较新的心跳。
+    """
+    remote, incoming = remote or {}, incoming or {}
+    pushed = dict(remote.get("pushed") or {})
+    for k, v in (incoming.get("pushed") or {}).items():
+        pushed.setdefault(k, v)        # 对方已有的记录优先，绝不覆盖或删除
+    hb_remote, hb_incoming = remote.get("hb"), incoming.get("hb")
+    hb = newer_hb(hb_remote, hb_incoming)
+    from_remote = bool(hb_remote) and hb == hb_remote and hb != hb_incoming
+    return {
+        "hb": hb,
+        "identity": ((remote.get("identity") or incoming.get("identity")) if from_remote
+                     else (incoming.get("identity") or remote.get("identity"))),
+        "pushed": pushed,
+        "target_id": incoming.get("target_id") or remote.get("target_id"),
+    }
+
+
+def gh_put_merged(cfg, token, path, obj, message, tries=3):
+    """读-合并-写，并用读到的 sha 做 CAS；并发写返回 409 时重读再合并。"""
+    last = None
+    for attempt in range(tries):
+        remote, sha = gh_get(cfg, token, path)
+        if remote is None:
+            # gh_get 会把网络错误吞成 None，此时无法安全合并；退回原写入路径，
+            # 让 gh_put 自己再取 sha，心跳仍要尽量写出去。
+            return gh_put(cfg, token, path, obj, message)
+        merged = merge_shared_state(remote, obj)
+        try:
+            return gh_put(cfg, token, path, merged, message, sha=sha)
+        except urllib.error.HTTPError as e:
+            if e.code != 409:
+                raise
+            last = e                   # 期间对方写过，重读再合并
+    raise last
 
 
 def gh_dispatch(cfg, token, workflow="bsc-vol.yml", ref="main", inputs=None):
@@ -795,8 +852,8 @@ def sync_state_up(cfg, state, heartbeat=True):
         "pushed": state.get("pushed", {}),
         "target_id": state.get("target_id"),
     }
-    gh_put(cfg, token, cfg["github"]["state_path"], payload,
-           "bscvol state+heartbeat [skip ci]")
+    gh_put_merged(cfg, token, cfg["github"]["state_path"], payload,
+                  "bscvol state+heartbeat [skip ci]")
     return True
 
 
