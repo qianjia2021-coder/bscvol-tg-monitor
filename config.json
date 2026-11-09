@@ -28,5 +28,7 @@
   "branch": "main",
   "token_env": "GITHUB_TOKEN",
   "state_path": "bsc_vol_state.json"
- }
+ },
+ "fresh_bypass_minutes": 10,
+ "eval_per_cycle": 2
 }
