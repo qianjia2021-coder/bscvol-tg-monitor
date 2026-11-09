@@ -774,8 +774,10 @@ def gh_put_merged(cfg, token, path, obj, message, tries=3):
     for attempt in range(tries):
         remote, sha = gh_get(cfg, token, path)
         if remote is None:
-            # gh_get 会把网络错误吞成 None，此时无法安全合并；退回原写入路径，
-            # 让 gh_put 自己再取 sha，心跳仍要尽量写出去。
+            # gh_get 会把网络错误吞成 None（404 也走这里）。先重试读取，
+            # 只有连续读不到才退回原写入路径，避免用旧快照覆盖远端记录。
+            if attempt + 1 < tries:
+                continue
             return gh_put(cfg, token, path, obj, message)
         merged = merge_shared_state(remote, obj)
         try:
@@ -893,6 +895,24 @@ def sync_state_down(cfg, state):
             and remote.get("target_id"):
         state["target_id"] = remote["target_id"]
     return n
+
+
+def should_push(cfg, state, token_key, log=None):
+    """推送前是否仍应推送：先复核共享去重库，再做永久去重判断。
+
+    两端都只在启动时 sync_state_down 一次，运行期间对端推过的币不在自己内存里。
+    gh_put_merged 只能保证「写回时不丢记录」，挡不住此刻的并发重复推送。
+    读远端失败时 fail-open：宁可冒重复风险，也不能漏掉一条真实命中。
+    """
+    k = token_key.lower()
+    if is_pushed(state, k):
+        return False
+    try:
+        sync_state_down(cfg, state)
+    except Exception as e:
+        if log:
+            log.warning("推送前复核去重库失败（按本地状态继续）: %s", e)
+    return not is_pushed(state, k)
 
 
 # ---------------------------------------------------------------- DexScreener 预筛
@@ -1149,7 +1169,7 @@ async def run_local():
                         continue
                     c["gecko_state"] = "ok"
                     c["backoff_step"] = 0
-                    if hit and not is_pushed(state, k):
+                    if hit and should_push(cfg, state, k, log):
                         text = build_message(k, hit, info, cfg)
                         try:
                             await tg_send(client, functions, cfg, state, text)
