@@ -332,7 +332,9 @@ def http_json(url, headers=None, data=None, timeout=15, tries=3, proxy=None, met
         try:
             req = urllib.request.Request(url, data=body, headers=h, method=method)
             with opener(proxy).open(req, timeout=timeout) as r:
-                return json.loads(_read_body(r))
+                raw = _read_body(r)
+                # 204 No Content 等场景没有响应体，返回空字典而不是解析失败
+                return json.loads(raw) if raw else {}
         except urllib.error.HTTPError as e:
             # 4xx 是确定性错误（未收录 / 不存在），重试没有意义，直接抛出
             if 400 <= e.code < 500 and e.code != 429:
@@ -347,7 +349,8 @@ def http_json(url, headers=None, data=None, timeout=15, tries=3, proxy=None, met
         try:
             req = urllib.request.Request(url, data=body, headers=h, method=method)
             with direct_opener().open(req, timeout=timeout) as r:
-                return json.loads(_read_body(r))
+                raw = _read_body(r)
+                return json.loads(raw) if raw else {}
         except Exception as e:
             last = e
     raise last
@@ -647,6 +650,60 @@ def gh_put(cfg, token, path, obj, message):
     return j.get("commit", {}).get("sha")
 
 
+def gh_dispatch(cfg, token, workflow="bsc-vol.yml", ref="main", inputs=None):
+    """手动触发一次 GitHub Actions 工作流。
+
+    GitHub 的 schedule 事件在新仓库/新 workflow 上可能长期不被调度器纳管
+    （实测同账号下 9 个旧 workflow 正常触发，今天新建的 2 个一次没触发）。
+    因此除了 cron，还需要一条不依赖调度器的触发路径 —— 本机看护就靠它补位。
+    """
+    url = f"https://api.github.com/repos/{cfg['github']['owner']}/{cfg['github']['repo']}" \
+          f"/actions/workflows/{workflow}/dispatches"
+    body = {"ref": ref}
+    if inputs:
+        body["inputs"] = inputs
+    http_json(url, headers=gh_headers(cfg, token), data=body,
+              timeout=25, tries=3, method="POST", allow_direct=True)
+    # dispatch 成功时 GitHub 返回 204 空体，无需解析
+    return True
+
+
+def gh_last_run_at(cfg, token, workflow="bsc-vol.yml"):
+    """最近一次 workflow 运行的创建时间（秒）；没有则返回 0"""
+    url = f"https://api.github.com/repos/{cfg['github']['owner']}/{cfg['github']['repo']}" \
+          f"/actions/workflows/{workflow}/runs?per_page=1"
+    try:
+        j = http_json(url, headers=gh_headers(cfg, token), timeout=20, allow_direct=True)
+        runs = j.get("workflow_runs") or []
+        if not runs:
+            return 0
+        ts = parse_iso(runs[0].get("created_at"))
+        return ts or 0
+    except Exception:
+        return 0
+
+
+def cloud_keepalive(cfg, log):
+    """本机在线时看护云端：若云端太久没跑，就手动补一次触发。
+
+    背景：GitHub 的 schedule 在新仓库上可能长期不被调度器纳管。本机在线时
+    主动补位，保证「云端随时可接管」这一前提成立 —— 本机一旦下线，最近一次
+    触发也已经在 10 分钟内，云端能立刻接手。
+    """
+    if not cfg.get("cloud_keepalive", True):
+        return
+    token = os.environ.get(cfg["github"]["token_env"], "") or os.environ.get("GITHUB_TOKEN", "")
+    if not token:
+        return
+    max_gap = int(cfg.get("cloud_keepalive_max_gap", 900))
+    last = gh_last_run_at(cfg, token)
+    now = int(time.time())
+    if last and now - last < max_gap:
+        return
+    gh_dispatch(cfg, token)
+    log.info("云端看护：已超过 %d 秒未运行，手动补触发一次", max_gap)
+
+
 def sync_state_up(cfg, state, heartbeat=True):
     """把心跳 + 去重状态写回仓库（单文件，减少提交噪音）"""
     token = os.environ.get(cfg["github"]["token_env"], "") or os.environ.get("GITHUB_TOKEN", "")
@@ -925,6 +982,10 @@ async def run_local():
                     sync_state_up(cfg, state, heartbeat=True)
                 except Exception as e:
                     log.warning("心跳同步失败: %s", e)
+                try:
+                    cloud_keepalive(cfg, log)
+                except Exception as e:
+                    log.warning("云端看护失败: %s", e)
 
         except Exception as e:
             log.exception("主循环异常: %s", e)
