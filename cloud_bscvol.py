@@ -211,6 +211,10 @@ async def main():
             continue
         if not hit:
             continue
+        # 推送前复核共享去重库：本机或其它轮次可能在我们评估期间已经推过同一个命中
+        if not bscvol.should_push(cfg, state, k, log):
+            log.info("本机/其它云端轮次已推送 %s，跳过", k)
+            continue
         if now - hit["minute_end"] > STALE_SECONDS:
             # 过期窗口：不推送，但记入 stale —— 不能占用 pushed，
             # 否则该币后续真正成立的新窗口会被永久去重屏蔽
