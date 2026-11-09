@@ -30,6 +30,25 @@ EVAL_TIME_BUDGET = 240          # 单次工作流最多评估多少秒（实测 
 FRESH_EVAL_LIMIT = 3           # 绕过预筛的新币最多评估几个
 
 
+def hb_writeback(hb_keep, hb_current):
+    """云端收尾写状态时该用哪个心跳：取「本机启动时抓到的」与「当前远端值」中较新的。
+
+    云端接管期间本机可能重启并写下新心跳；若直接写回启动时抓到的旧值，就会把
+    本机的新心跳盖掉，外部触发器（按 hb 判断本机是否在线）会继续每 2 分钟 dispatch，
+    形成「云端反复接管 + 本机心跳被反复写旧」的自激循环。
+    """
+    if not hb_current:
+        return hb_keep
+    if not hb_keep:
+        return hb_current
+    try:
+        if bscvol.parse_iso(hb_current) >= bscvol.parse_iso(hb_keep):
+            return hb_current
+        return hb_keep
+    except Exception:
+        return hb_current
+
+
 def local_resumed(hb_iso, now_ts, takeover_after):
     """接管途中本机恢复心跳就返回 True，云端据此让位，避免同一命中被推两次"""
     if not hb_iso:
@@ -224,9 +243,15 @@ async def main():
 
     bscvol.save_state(state)
     if token:
+        hb_final = hb_keep
+        try:
+            remote_end, _ = bscvol.gh_get(cfg, token, cfg["github"]["state_path"])
+            hb_final = hb_writeback(hb_keep, (remote_end or {}).get("hb"))
+        except Exception as e:
+            log.warning("收尾读远端心跳失败（沿用启动值）: %s", e)
         try:
             bscvol.gh_put(cfg, token, cfg["github"]["state_path"],
-                          {"hb": hb_keep, "identity": "cloud",
+                          {"hb": hb_final, "identity": "cloud",
                            "pushed": state["pushed"], "target_id": state.get("target_id")},
                           "bscvol cloud state [skip ci]")
         except Exception as e:
