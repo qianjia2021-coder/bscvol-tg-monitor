@@ -6,6 +6,7 @@ import asyncio
 import os
 import sys
 import time
+import urllib.error
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bscvol
@@ -22,6 +23,9 @@ DRY = os.environ.get("BSCVOL_DRY", "") == "1"
 SELFTEST = os.environ.get("VOL_SELFTEST", "") == "1"
 EVAL_BUDGET = 8                # 单次工作流最多评估多少个候选（受 5 分钟节拍与 10 分钟超时约束）
 EVAL_TIME_BUDGET = 240          # 单次工作流最多评估多少秒（实测 420s 会跑到 7.5 分钟，撑破节拍）
+# GitHub Actions 走共享出口 IP，Gecko 免费配额被全世界共用，429 概率远高于本机。
+# 绕过预筛的新币最吃配额（每个至少 2 次 Gecko 请求），因此单独限量。
+FRESH_EVAL_LIMIT = 3           # 绕过预筛的新币最多评估几个
 
 
 def local_resumed(hb_iso, now_ts, takeover_after):
@@ -131,13 +135,17 @@ async def main():
     rest = [k for k in todo if k not in fresh]
     m5 = bscvol.dex_prefilter(rest) if rest else {}
     hot = [k for k in rest if m5.get(k, 0) >= prefilter]
-    # 上线 10 分钟内的新币绕过预筛直接评估
+    # 上线 10 分钟内的新币绕过预筛直接评估，但共享 IP 下它们最吃配额，限量优先用预算
+    fresh = fresh[:FRESH_EVAL_LIMIT]
     queue = hot + fresh
-    log.info("候选 %d（热 %d，新币 %d），预筛后 %d", len(todo), len(hot), len(fresh), len(queue))
+    log.info("候选 %d（热 %d，新币 %d→限 %d），预筛后 %d",
+             len(todo), len(hot), len([k for k in todo if now - cands[k]["found"] <= bypass]),
+             FRESH_EVAL_LIMIT, len(queue))
 
     client = functions = None
     sent = 0
     stale_marked = 0
+    rate_limited = False
     t_start = time.time()
     for k in queue:
         if sent >= EVAL_BUDGET or (time.time() - t_start) > EVAL_TIME_BUDGET:
@@ -145,6 +153,15 @@ async def main():
             break
         try:
             hit, info = bscvol.evaluate_token(k, cfg, now, deep_minutes=cfg["deep_minutes"])
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                # 共享 IP 撞到 Gecko 限流：立即停手，不再消耗配额，
+                # 剩下的候选留给下一轮（本机在线时云端本就不该接管）
+                rate_limited = True
+                log.warning("Gecko 限流(429)，本轮停止评估 %s（剩余候选留到下一轮）", k)
+                break
+            log.warning("评估失败 %s: %s", k, e)
+            continue
         except Exception as e:
             log.warning("评估失败 %s: %s", k, e)
             continue
@@ -206,7 +223,8 @@ async def main():
                           "bscvol cloud state [skip ci]")
         except Exception as e:
             log.warning("写回云端状态失败: %s", e)
-    print("DONE: pushed=%d candidates=%d hot=%d stale=%d" % (sent, len(cands), len(hot), stale_marked))
+    print("DONE: pushed=%d candidates=%d hot=%d stale=%d rate_limited=%s"
+          % (sent, len(cands), len(hot), stale_marked, rate_limited))
 
 
 if __name__ == "__main__":
