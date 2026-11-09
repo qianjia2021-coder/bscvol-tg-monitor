@@ -1,0 +1,31 @@
+{
+ "identity": "cloud",
+ "threshold_usd": 100000,
+ "need_consecutive": 2,
+ "max_age_minutes": 90,
+ "prefilter_m5_usd": 50000,
+ "poll_seconds": 12,
+ "max_block_gap": 6000,
+ "heartbeat_seconds": 180,
+ "takeover_after": 600,
+ "watch_tokens": [],
+ "rpc": [
+  "https://bsc-rpc.publicnode.com",
+  "https://1rpc.io/bnb"
+ ],
+ "telegram": {
+  "api_id": 0,
+  "api_hash": "",
+  "session": "cloud.session",
+  "invite_hash": "0NCSpGbGf_MyNWU1",
+  "group_title": "BSC推送群"
+ },
+ "tg_proxy": null,
+ "github": {
+  "owner": "qianjia2021-coder",
+  "repo": "bscvol-tg-monitor",
+  "branch": "main",
+  "token_env": "GITHUB_TOKEN",
+  "state_path": "bsc_vol_state.json"
+ }
+}
