@@ -1,9 +1,9 @@
 {
  "identity": "cloud",
- "threshold_usd": 100000,
+ "threshold_usd": 30000,
  "need_consecutive": 2,
  "max_age_minutes": 90,
- "prefilter_m5_usd": 50000,
+ "prefilter_m5_usd": 15000,
  "poll_seconds": 12,
  "max_block_gap": 6000,
  "heartbeat_seconds": 180,
