@@ -1,13 +1,22 @@
 # -*- coding: utf-8 -*-
 """BSC 新币「连续 N 个自然分钟成交额 ≥ 阈值」监控 —— 本地守护 + 云端共用内核
 独立运行：自带会话副本 / 独立 state / 独立日志，不读写其它任务的数据。
+
+模块分层：
+  规则内核   detect / parse_paircreated / pick_token*   —— 行为由 test_bscvol.py 固定
+  基础设施   http / bot_api / github / logging / state
+  数据源     Chain(链上扫块) / gecko_* / dex_m5
+  判定执行   evaluate_token / build_message / tg_send
+  调度       run_local(本机守护) / cloud_bscvol(云端接管)
 """
 import base64
 import datetime as dt
 import gzip
+import html
 import io
 import json
 import logging
+import logging.handlers
 import os
 import sys
 import time
@@ -37,11 +46,21 @@ TOPIC_PAIRCREATED = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31af
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
+# 候选不在 Gecko 被收录时的重试间隔（秒），逐级退避，避免浪费配额
+NO_POOL_BACKOFF = (60, 120, 240, 480, 900)
+
 
 # ---------------------------------------------------------------- 规则内核
 def detect(minutes, now_ts, threshold, need=2, launch_ts=None):
     """minutes: [(minute_ts, usd), ...]；只认已完整结束的自然分钟。
-    返回首个满足「连续 need 分钟各自 ≥ threshold」的窗口。"""
+    返回首个满足「连续 need 分钟各自 ≥ threshold」的窗口。
+
+    不变式（改动前必须先跑通 test_bscvol.py）：
+      * 只认 ts + 60 <= now_ts 的自然分钟，进行中的这一分钟不算；
+      * 窗口内相邻两分钟必须恰好相差 60 秒，缺一分钟即断开；
+      * launch_ts 之前（上线分钟向下取整）的分钟不计入；
+      * 阈值为闭区间 v >= threshold。
+    """
     done = sorted((ts, float(v)) for ts, v in minutes
                   if int(ts) % 60 == 0 and ts + 60 <= now_ts)
     for i in range(len(done) - need + 1):
@@ -104,6 +123,48 @@ def mark_pushed(state, token, detail, reason="strict"):
     }
 
 
+# ---------------------------------------------------------------- 调度辅助
+def candidate_tier(cand, now, cfg):
+    """候选优先级分层（数字越小越先评估）。
+
+    0 热币 + Gecko 已收录     —— 最可能成立，立刻查
+    1 热币 + 尚未收录         —— 币在放量，只是数据源还没跟上
+    2 新币(10 分钟内) + 已收录 —— 绕过预筛，但可能还没放量
+    3 新币(10 分钟内) + 未收录 —— 兜底
+    4 既不热也不新             —— 只等下一轮预筛，不占用 Gecko 配额
+    """
+    prefilter = float(cfg.get("prefilter_m5_usd", 50000))
+    bypass = int(cfg.get("fresh_bypass_minutes", 10)) * 60
+    m5 = float(cand.get("m5") or 0)
+    hot = m5 >= prefilter
+    fresh = (now - int(cand.get("found", now))) <= bypass
+    indexed = cand.get("gecko_state") == "ok"
+    if hot and indexed:
+        return 0
+    if hot:
+        return 1
+    if fresh and indexed:
+        return 2
+    if fresh:
+        return 3
+    return 4
+
+
+def next_backoff(step):
+    """未收录候选的重试间隔，逐级退避"""
+    step = max(0, min(int(step), len(NO_POOL_BACKOFF) - 1))
+    return NO_POOL_BACKOFF[step]
+
+
+def min_probe_age(cfg):
+    """判定至少需要 need 个完整自然分钟，早于此年龄去查必然查不到，白耗配额"""
+    need = int(cfg.get("need_consecutive", 2))
+    explicit = cfg.get("min_probe_age_seconds")
+    if explicit:
+        return int(explicit)
+    return need * 60
+
+
 # ---------------------------------------------------------------- 基础设施
 def now_iso():
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
@@ -137,7 +198,12 @@ def setup_logging(name="bscvol"):
         return logger
     logger.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
-    fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    try:
+        # 20MB 滚动，避免日志无限增长；文件名保持 bscvol.log 不变
+        fh = logging.handlers.RotatingFileHandler(
+            LOG_FILE, maxBytes=20 * 1024 * 1024, backupCount=2, encoding="utf-8")
+    except Exception:
+        fh = logging.FileHandler(LOG_FILE, encoding="utf-8")
     fh.setFormatter(fmt)
     logger.addHandler(fh)
     try:
@@ -165,6 +231,29 @@ def detect_system_proxy():
 
 
 _opener = None
+_opener_proxy = None
+
+
+def opener(proxy=None):
+    """全局 opener；显式传入 proxy 时按需重建"""
+    global _opener, _opener_proxy
+    if proxy is None:
+        proxy = _opener_proxy if _opener is not None else detect_system_proxy()
+    if _opener is None or proxy != _opener_proxy:
+        _opener_proxy = proxy
+        if proxy:
+            _opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        else:
+            _opener = urllib.request.build_opener()
+    return _opener
+
+
+def _read_body(resp):
+    raw = resp.read()
+    if resp.headers.get("Content-Encoding") == "gzip":
+        raw = gzip.GzipFile(fileobj=io.BytesIO(raw)).read()
+    return raw
 
 
 def bot_api(token, method, payload=None, timeout=25, tries=3):
@@ -177,10 +266,7 @@ def bot_api(token, method, payload=None, timeout=25, tries=3):
         try:
             req = urllib.request.Request(url, data=body, headers=h, method="POST")
             with opener().open(req, timeout=timeout) as r:
-                raw = r.read()
-                if r.headers.get("Content-Encoding") == "gzip":
-                    raw = gzip.GzipFile(fileobj=io.BytesIO(raw)).read()
-                return json.loads(raw)
+                return json.loads(_read_body(r))
         except urllib.error.HTTPError as e:
             raw = e.read()
             try:
@@ -191,18 +277,6 @@ def bot_api(token, method, payload=None, timeout=25, tries=3):
             last = e
         time.sleep(0.8 + attempt)
     raise last
-
-
-def opener(proxy=None):
-    global _opener
-    if _opener is None:
-        proxy = proxy or detect_system_proxy()
-        if proxy:
-            _opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-        else:
-            _opener = urllib.request.build_opener()
-    return _opener
 
 
 def http_json(url, headers=None, data=None, timeout=15, tries=3, proxy=None, method=None):
@@ -219,10 +293,13 @@ def http_json(url, headers=None, data=None, timeout=15, tries=3, proxy=None, met
         try:
             req = urllib.request.Request(url, data=body, headers=h, method=method)
             with opener(proxy).open(req, timeout=timeout) as r:
-                raw = r.read()
-                if r.headers.get("Content-Encoding") == "gzip":
-                    raw = gzip.GzipFile(fileobj=io.BytesIO(raw)).read()
-                return json.loads(raw)
+                return json.loads(_read_body(r))
+        except urllib.error.HTTPError as e:
+            # 4xx 是确定性错误（未收录 / 不存在），重试没有意义，直接抛出
+            if 400 <= e.code < 500 and e.code != 429:
+                raise
+            last = e
+            time.sleep(0.8 + attempt)
         except Exception as e:
             last = e
             time.sleep(0.8 + attempt)
@@ -303,7 +380,7 @@ def gecko_minutes(pool_id, limit=10, before_ts=None):
         url += f"&before_timestamp={int(before_ts)}"
     j = gecko_get(url)
     out = []
-    for c in (j.get("data", {}).get("attributes", {}) or {}).get("ohlcv_list", []) or []:
+    for c in ((j.get("data") or {}).get("attributes") or {}).get("ohlcv_list") or []:
         out.append((int(c[0]), float(c[5] or 0)))
     return out
 
@@ -323,7 +400,7 @@ def evaluate_token(token, cfg, now_ts=None, deep_minutes=10, ignore_age=False):
     max_age = cfg["max_age_minutes"] * 60
     pools = gecko_pools(token)
     if not pools:
-        return None, {"state": "no_pool"}
+        return None, {"state": "no_pool", "pool_count": 0}
 
     live = []
     for p in pools:
@@ -341,10 +418,11 @@ def evaluate_token(token, cfg, now_ts=None, deep_minutes=10, ignore_age=False):
             "txns": at.get("transactions") or {},
         })
     if not live:
-        return None, {"state": "all_pools_old"}
+        return None, {"state": "all_pools_old", "pool_count": len(pools)}
 
     if sum(p["m5"] for p in live) < cfg["prefilter_m5_usd"]:
-        return None, {"state": "low_m5", "m5": sum(p["m5"] for p in live)}
+        return None, {"state": "low_m5", "m5": sum(p["m5"] for p in live),
+                      "pool_count": len(live)}
 
     top = max(p["reserve"] for p in live)
     use = [p for p in live if p["reserve"] >= top * 0.15] or [max(live, key=lambda x: x["reserve"])]
@@ -360,6 +438,7 @@ def evaluate_token(token, cfg, now_ts=None, deep_minutes=10, ignore_age=False):
     info = {
         "state": "hit" if hit else "watching",
         "pools": use,
+        "pool_count": len(live),
         "launch": launch,
         "minutes": minutes,
         "total_vol": sum(minutes.values()),
@@ -375,6 +454,7 @@ def evaluate_token(token, cfg, now_ts=None, deep_minutes=10, ignore_age=False):
 # ---------------------------------------------------------------- 电报
 def build_message(token, hit, info, cfg):
     m = hit["vols"]
+    need = int(cfg.get("need_consecutive", 2))
     launch = info["launch"]
     age_min = int((time.time() - launch) // 60)
     t_txt = time.strftime("%H:%M", time.localtime(launch))
@@ -387,8 +467,14 @@ def build_message(token, hit, info, cfg):
     def f(v):
         return f"{v:,.0f}"
 
+    # 池名/符号来自外部数据，必须转义，否则 Telegram 返回 400 导致推送永久失败
+    pool_name = html.escape(pool_name, quote=False)
+    sym = html.escape(sym, quote=False)
+
+    head = ("🚨 <b>BSC 新币 2 分钟连续放量</b>" if need == 2
+            else f"🚨 <b>BSC 新币 {need} 分钟连续放量</b>")
     lines = [
-        "🚨 <b>BSC 新币 2 分钟连续放量</b>",
+        head,
         f"<b>{sym}</b>　上线 {t_txt}（{age_min} 分钟前）",
         f"合约：<code>{token}</code>",
         f"连续两分钟：{f(m[0])} + {f(m[1])} = <b>{f(sum(m))} USD</b>",
@@ -446,8 +532,10 @@ async def tg_ensure_target(client, functions, cfg, state):
 async def tg_send(client, functions, cfg, state, text):
     bot_token = (cfg.get("bot_token") or os.environ.get("VOL_BOT_TOKEN") or "").strip()
     if bot_token:
+        # 目标群一律以 config.json 的 telegram.chat_id 为准，不接受远端旧值
+        chat_id = cfg["telegram"].get("chat_id") or state.get("target_id")
         res = bot_api(bot_token, "sendMessage",
-                      {"chat_id": cfg["telegram"].get("chat_id") or state.get("target_id"),
+                      {"chat_id": chat_id,
                        "text": text, "parse_mode": "html", "disable_web_page_preview": "true"})
         if not res.get("ok"):
             raise RuntimeError("Bot 发送失败: %s" % str(res.get("description"))[:200])
@@ -524,7 +612,9 @@ def sync_state_down(cfg, state):
         if k not in local:
             local[k] = v
             n += 1
-    if not state.get("target_id") and remote.get("target_id") and not cfg["telegram"].get("chat_id"):
+    # 目标群只认本机 config.json，绝不用远端旧值覆盖
+    if not cfg["telegram"].get("chat_id") and not state.get("target_id") \
+            and remote.get("target_id"):
         state["target_id"] = remote["target_id"]
     return n
 
@@ -539,10 +629,10 @@ def _chunks(seq, n):
 
 
 def dex_m5(tokens):
-    """一次请求最多 30 个地址，返回 {token: m5_usd}"""
+    """一次请求最多 30 个地址，返回 {token: m5_usd}（只含有成交数据的地址）"""
     out = {}
-    uniq = list({t.lower() for t in tokens})
-    for part in _chunks(uniq, 30):
+    for part in _chunks(list({t.lower() for t in tokens}), 30):
+        part_set = set(part)
         try:
             j = http_json(DEX + ",".join(part), timeout=12, tries=2)
         except Exception:
@@ -554,9 +644,34 @@ def dex_m5(tokens):
             m5 = float(vs.get("m5") or 0)
             for side in ("baseToken", "quoteToken"):
                 a = ((p.get(side) or {}).get("address") or "").lower()
-                if a and a in part:
-                    out[a] = out.get(a, 0) + m5
+                if a and a in part_set:
+                    out[a] = out.get(a, 0.0) + m5
     return {k.lower(): v for k, v in out.items()}
+
+
+def dex_prefilter(tokens):
+    """预筛专用：请求成功的地址一定在返回值里（无成交记 0.0），
+    请求失败的地址不在返回值里 —— 调用方据此区分「查过没有量」与「没查成」，
+    避免把没查成的候选误判成零成交而永久漏掉。"""
+    out = {}
+    for part in _chunks(list({t.lower() for t in tokens}), 30):
+        part_set = set(part)
+        try:
+            j = http_json(DEX + ",".join(part), timeout=12, tries=2)
+        except Exception:
+            continue
+        for a in part:
+            out.setdefault(a, 0.0)
+        for p in j.get("pairs") or []:
+            if (p.get("chainId") or "").lower() != "bsc":
+                continue
+            vs = p.get("volume") or {}
+            m5 = float(vs.get("m5") or 0)
+            for side in ("baseToken", "quoteToken"):
+                a = ((p.get(side) or {}).get("address") or "").lower()
+                if a and a in part_set:
+                    out[a] = out.get(a, 0.0) + m5
+    return out
 
 
 # ---------------------------------------------------------------- 本地守护
@@ -628,49 +743,90 @@ async def run_local():
                 for tok in pick_token_candidates(p):
                     k = tok.lower()
                     if k in cands:
-                        cands[k]["pairs"].append(p["pair"])
+                        if p["pair"] not in cands[k]["pairs"]:
+                            cands[k]["pairs"].append(p["pair"])
                     else:
                         cands[k] = {"pairs": [p["pair"]], "found": now,
                                     "found_block": p["block"], "next_check": 0}
             # 清理过老候选（手动指定的保留）
+            ttl = int(cfg.get("max_age_minutes", 90)) * 60
             for k in list(cands):
                 if cands[k].get("manual"):
                     continue
-                if now - int(cands[k].get("found", now)) > cfg["max_age_minutes"] * 60:
+                if now - int(cands[k].get("found", now)) > ttl:
                     cands.pop(k, None)
 
             due = [k for k, v in cands.items()
                    if not is_pushed(state, k) and now >= int(v.get("next_check", 0))]
             if due:
-                due.sort(key=lambda k: -int(cands[k].get("found", 0)))   # 新币优先
-                m5 = dex_m5(due[:30])
-                pf = cfg["prefilter_m5_usd"]
-                bypass = cfg.get("fresh_bypass_minutes", 10) * 60
-                hot = [k for k in due if m5.get(k, 0) >= pf]
-                fresh = [k for k in due
-                         if m5.get(k, 0) < pf and now - int(cands[k]["found"]) <= bypass]
-                rest = [k for k in due if k not in hot and k not in fresh]
-                for k in rest:
-                    cands[k]["next_check"] = now + 120
-                budget = cfg.get("eval_per_cycle", 4)
-                queue = hot + fresh            # 预筛命中优先，其次上线 10 分钟内的新币
-                for k in queue:
+                # ---- 预筛：轮转覆盖所有候选，而不是只看最新 30 个 ----
+                # 原实现只查 due[:30]，老候选永远拿不到 m5，永远进不了 hot 队列，
+                # 10 分钟后被清掉 —— 这是漏推的主因。这里按「最久没预筛过」排序，
+                # 保证每个候选在一段时间内都能被查到，命中后才进入评估队列。
+                dex_refresh = int(cfg.get("dex_refresh_seconds", 45))
+                need_dex = [k for k in due
+                            if now - int(cands[k].get("dex_at", 0)) >= dex_refresh]
+                need_dex.sort(key=lambda k: (int(cands[k].get("dex_at", 0)),
+                                             candidate_tier(cands[k], now, cfg)))
+                batch = int(cfg.get("prefilter_batch", 90))
+                window = need_dex[:batch]
+                if window:
+                    m5 = dex_prefilter(window)
+                    ok = 0
+                    for k in window:
+                        if k in m5:               # 只更新查成功的，查失败的保留旧值下轮重来
+                            cands[k]["dex_at"] = now
+                            cands[k]["m5"] = float(m5[k])
+                            ok += 1
+                    hot_count = sum(1 for k in window
+                                    if float(cands[k].get("m5") or 0) >= cfg["prefilter_m5_usd"])
+                    log.info("预筛 %d 个候选（成功 %d），热币 %d 个",
+                             len(window), ok, hot_count)
+
+                # ---- 分级排队，热点优先 ----
+                due.sort(key=lambda k: (candidate_tier(cands[k], now, cfg),
+                                        -int(cands[k].get("found", 0))))
+                budget = int(cfg.get("eval_per_cycle", 2))
+                probe_min_age = min_probe_age(cfg)
+                bypass = int(cfg.get("fresh_bypass_minutes", 10)) * 60
+                for k in due:
+                    c = cands[k]
+                    tier = candidate_tier(c, now, cfg)
+                    if tier == 4:
+                        # 既不热也不新：不占 Gecko 配额，等下一轮预筛
+                        c["next_check"] = now + 120
+                        continue
                     if budget <= 0:
-                        cands[k]["next_check"] = now + 12
+                        c["next_check"] = now + 12
+                        continue
+                    age = now - int(c.get("found", now))
+                    if age < probe_min_age:
+                        # 判定窗口尚未成立，此刻去查必然 no_pool，等够了再来
+                        c["next_check"] = now + min(30, max(5, probe_min_age - age))
                         continue
                     budget -= 1
-                    # 预筛命中的高频复查；Gecko 还没收录的新币放慢到 1 分钟一次
-                    cands[k]["next_check"] = now + (20 if m5.get(k, 0) >= pf else 60)
-                    log.info("评估候选 %s m5=%.0f age=%.0f分钟", k, m5.get(k, 0),
-                             (now - int(cands[k]["found"])) / 60.0)
+                    hot = float(c.get("m5") or 0) >= cfg["prefilter_m5_usd"]
+                    fresh = age <= bypass
+                    c["next_check"] = now + (20 if hot else 60)
+                    log.info("评估候选 %s tier=%d m5=%.0f age=%.0f分钟",
+                             k, tier, float(c.get("m5") or 0), age / 60.0)
                     try:
                         hit, info = evaluate_token(k, cfg, now,
-                                                   ignore_age=bool(cands[k].get("manual")))
+                                                   ignore_age=bool(c.get("manual")))
                     except Exception as e:
                         log.warning("评估失败 %s: %s", k, e)
                         continue
                     log.info("评估 %s -> %s m5=%.0f 分钟数=%d", k, info.get("state"),
                              info.get("m5") or 0, len(info.get("minutes") or {}))
+                    if info.get("state") == "no_pool":
+                        # 未收录：退避重试，避免每轮白烧一次配额
+                        step = int(c.get("backoff_step", 0))
+                        c["backoff_step"] = min(step + 1, len(NO_POOL_BACKOFF) - 1)
+                        c["gecko_state"] = "no_pool"
+                        c["next_check"] = now + next_backoff(c["backoff_step"])
+                        continue
+                    c["gecko_state"] = "ok"
+                    c["backoff_step"] = 0
                     if hit and not is_pushed(state, k):
                         text = build_message(k, hit, info, cfg)
                         try:
@@ -686,10 +842,6 @@ async def run_local():
                             sync_state_up(cfg, state, heartbeat=True)
                         except Exception as e:
                             log.warning("云端同步失败: %s", e)
-                    elif info.get("state") in ("all_pools_old", "no_pool"):
-                        if (not cands[k].get("manual")
-                                and now - int(cands[k].get("found", now)) > 600):
-                            cands.pop(k, None)
 
             save_state(state)
             if time.time() - last_hb > cfg["heartbeat_seconds"]:
@@ -705,8 +857,8 @@ async def run_local():
 
 
 # ---------------------------------------------------------------- 单次/回放（自测用）
-async def run_once(token=None, minutes_replay=None):
-    """token: 直接评估某合约；minutes_replay: 指定分钟数（回放验证用）"""
+async def run_once(token=None):
+    """token: 直接评估某合约，打印判定结果与推送文案"""
     log = setup_logging()
     cfg = load_config()
     if token:
@@ -714,8 +866,6 @@ async def run_once(token=None, minutes_replay=None):
         print(json.dumps({"hit": hit, "state": info.get("state"),
                           "m5": info.get("m5"), "minutes": sorted(info.get("minutes", {}).items())},
                          ensure_ascii=False, indent=1))
-        if hit and minutes_replay:
-            pass
         if hit:
             print("\n" + build_message(token, hit, info, cfg))
         return hit
