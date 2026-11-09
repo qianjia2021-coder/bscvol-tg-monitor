@@ -132,13 +132,18 @@ def candidate_tier(cand, now, cfg):
     2 新币(10 分钟内) + 已收录 —— 绕过预筛，但可能还没放量
     3 新币(10 分钟内) + 未收录 —— 兜底
     4 既不热也不新             —— 只等下一轮预筛，不占用 Gecko 配额
+    5 Gecko 已收录但池子全老   —— 超出币龄上限，查了也不会成立，不占配额
     """
     prefilter = float(cfg.get("prefilter_m5_usd", 50000))
     bypass = int(cfg.get("fresh_bypass_minutes", 10)) * 60
     m5 = float(cand.get("m5") or 0)
     hot = m5 >= prefilter
     fresh = (now - int(cand.get("found", now))) <= bypass
-    indexed = cand.get("gecko_state") == "ok"
+    state = cand.get("gecko_state")
+    if state == "old":
+        # Gecko 收录的池子全部超过币龄上限，判定不可能成立，别再查
+        return 5
+    indexed = state == "ok"
     if hot and indexed:
         return 0
     if hot:
@@ -157,12 +162,16 @@ def next_backoff(step):
 
 
 def tier4_wait(cand):
-    """tier4 候选（不占 Gecko 配额）的下次检查间隔。
+    """tier4/tier5 候选（不占 Gecko 配额）的下次检查间隔。
 
-    未被 Gecko 收录的候选要沿用自身退避节奏；若一律压回 120 秒，
-    退避会被打断，未收录的新币就会每 2 分钟重查一次 Gecko —— 正是配额空烧的根源。
+    - 未被 Gecko 收录的候选要沿用自身退避节奏；若一律压回 120 秒，
+      退避会被打断，未收录的新币就会每 2 分钟重查一次 Gecko —— 正是配额空烧的根源。
+    - 池子已全老（超币龄上限）的候选判定不可能成立，间隔拉长到 5 分钟。
     """
-    if cand.get("gecko_state") == "no_pool":
+    state = cand.get("gecko_state")
+    if state == "old":
+        return 300
+    if state == "no_pool":
         return next_backoff(cand.get("backoff_step", 0))
     return 120
 
@@ -429,6 +438,7 @@ def evaluate_token(token, cfg, now_ts=None, deep_minutes=10, ignore_age=False):
             "txns": at.get("transactions") or {},
         })
     if not live:
+        # Gecko 收录的池子全部超过币龄上限 —— 判定不可能成立
         return None, {"state": "all_pools_old", "pool_count": len(pools)}
 
     if sum(p["m5"] for p in live) < cfg["prefilter_m5_usd"]:
@@ -819,8 +829,9 @@ async def run_local():
                 for k in due:
                     c = cands[k]
                     tier = candidate_tier(c, now, cfg)
-                    if tier == 4:
-                        # 既不热也不新：不占 Gecko 配额，等下一轮预筛。
+                    if tier >= 4:
+                        # tier4 既不热也不新；tier5 池子全老（超币龄上限）。
+                        # 两者都不占 Gecko 配额，等下一轮预筛。
                         # 保留自身退避节奏（未收录的候选退避可能已达 900s），
                         # 不能一律压回 120s —— 那会打断退避，让未收录的新币
                         # 每 2 分钟就重查一次 Gecko，正是配额空烧的根源。
@@ -854,6 +865,12 @@ async def run_local():
                         c["backoff_step"] = min(step + 1, len(NO_POOL_BACKOFF) - 1)
                         c["gecko_state"] = "no_pool"
                         c["next_check"] = now + next_backoff(c["backoff_step"])
+                        continue
+                    if info.get("state") == "all_pools_old":
+                        # 池子全老（超过币龄上限）：判定不可能成立，
+                        # 标记 old 让它退出评估队列，不再反复占用 Gecko 配额
+                        c["gecko_state"] = "old"
+                        c["next_check"] = now + 300
                         continue
                     c["gecko_state"] = "ok"
                     c["backoff_step"] = 0
