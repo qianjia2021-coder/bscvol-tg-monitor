@@ -800,6 +800,23 @@ def sync_state_up(cfg, state, heartbeat=True):
     return True
 
 
+def heartbeat_now(cfg, state, sync_fn=None, log=None):
+    """立刻发布一次心跳，返回是否成功。
+
+    本机重启后需要马上刷心跳：外部触发器（Cloudflare Worker）与云端都靠 hb 判断
+    「本机是否在线」。若等到首个主循环走完才写，重启后的头半分钟里两端都会以为
+    本机离线 —— 外部触发器会连着 dispatch、云端可能接管，造成重复推送。
+    """
+    sync_fn = sync_fn or sync_state_up
+    try:
+        sync_fn(cfg, state, heartbeat=True)
+        return True
+    except Exception as e:
+        if log:
+            log.warning("启动心跳写入失败: %s", e)
+        return False
+
+
 def sync_state_down(cfg, state):
     """从仓库拉去重状态并合并（云端推送过的不能在本机重复推）"""
     token = os.environ.get(cfg["github"]["token_env"], "") or os.environ.get("GITHUB_TOKEN", "")
@@ -920,9 +937,9 @@ async def run_local():
     except Exception as e:
         log.warning("拉取云端状态失败: %s", e)
     save_state(state)
+    last_hb = time.time()
+    heartbeat_now(cfg, state, log=log)
     log.info("启动：%s", tag)
-
-    last_hb = 0.0
     while True:
         t0 = time.time()
         try:
