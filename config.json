@@ -33,5 +33,7 @@
  "eval_per_cycle": 2,
  "dex_refresh_seconds": 45,
  "prefilter_batch": 90,
- "min_probe_age_seconds": 120
+ "min_probe_age_seconds": 120,
+ "cloud_keepalive": true,
+ "cloud_keepalive_max_gap": 900
 }
