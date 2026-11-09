@@ -269,7 +269,12 @@ GECKO = "https://api.geckoterminal.com/api/v2/networks/bsc"
 
 
 def gecko_pools(token):
-    j = http_json(f"{GECKO}/tokens/{token}/pools", timeout=18)
+    try:
+        j = http_json(f"{GECKO}/tokens/{token}/pools", timeout=18)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:      # 新币尚未被 Gecko 收录
+            return []
+        raise
     return j.get("data", []) or []
 
 
@@ -620,12 +625,26 @@ async def run_local():
             due = [k for k, v in cands.items()
                    if not is_pushed(state, k) and now >= int(v.get("next_check", 0))]
             if due:
+                due.sort(key=lambda k: -int(cands[k].get("found", 0)))   # 新币优先
                 m5 = dex_m5(due[:30])
-                for k in due:
-                    cands[k]["next_check"] = now + 20
-                    if m5.get(k, 0) < cfg["prefilter_m5_usd"]:
+                pf = cfg["prefilter_m5_usd"]
+                bypass = cfg.get("fresh_bypass_minutes", 10) * 60
+                hot = [k for k in due if m5.get(k, 0) >= pf]
+                fresh = [k for k in due
+                         if m5.get(k, 0) < pf and now - int(cands[k]["found"]) <= bypass]
+                rest = [k for k in due if k not in hot and k not in fresh]
+                for k in rest:
+                    cands[k]["next_check"] = now + 120
+                budget = cfg.get("eval_per_cycle", 4)
+                queue = hot + fresh            # 预筛命中优先，其次上线 10 分钟内的新币
+                for k in queue:
+                    if budget <= 0:
+                        cands[k]["next_check"] = now + 12
                         continue
-                    log.info("预筛命中 %s m5=%.0f", k, m5.get(k, 0))
+                    budget -= 1
+                    cands[k]["next_check"] = now + 20
+                    log.info("评估候选 %s m5=%.0f age=%.0f分钟", k, m5.get(k, 0),
+                             (now - int(cands[k]["found"])) / 60.0)
                     try:
                         hit, info = evaluate_token(k, cfg, now,
                                                    ignore_age=bool(cands[k].get("manual")))
