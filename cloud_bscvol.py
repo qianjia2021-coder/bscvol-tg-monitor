@@ -24,6 +24,16 @@ EVAL_BUDGET = 8                # 单次工作流最多评估多少个候选（�
 EVAL_TIME_BUDGET = 240          # 单次工作流最多评估多少秒（实测 420s 会跑到 7.5 分钟，撑破节拍）
 
 
+def local_resumed(hb_iso, now_ts, takeover_after):
+    """接管途中本机恢复心跳就返回 True，云端据此让位，避免同一命中被推两次"""
+    if not hb_iso:
+        return False
+    try:
+        return (now_ts - bscvol.parse_iso(hb_iso)) < takeover_after
+    except Exception:
+        return False
+
+
 async def tg_cloud_client(cfg):
     from telethon import TelegramClient, functions
     from telethon.sessions import StringSession
@@ -152,6 +162,15 @@ async def main():
             stale_marked += 1
             continue
         text = bscvol.build_message(k, hit, info, cfg)
+        # 接管途中本机若已恢复，云端让位：否则同一个命中会被本机与云端各推一次
+        if token:
+            try:
+                remote_now, _ = bscvol.gh_get(cfg, token, cfg["github"]["state_path"])
+                if local_resumed((remote_now or {}).get("hb"), time.time(), cfg["takeover_after"]):
+                    log.info("本机已恢复心跳，云端让位，本轮不再推送")
+                    break
+            except Exception as e:
+                log.warning("让位检查失败（继续推送）: %s", e)
         if DRY:
             log.info("[DRY] 会推送 %s %s", k, hit["vols"])
             print(text)
