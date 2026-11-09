@@ -14,7 +14,9 @@ import bscvol
 CFG_OVERRIDES = {
     "identity": "cloud",
     "max_block_gap": 6000,      # ≈45 分钟
-    "deep_minutes": 60,         # 回看 60 分钟分钟线
+    # 回看分钟线深度。与本机 config.json 保持一致（30 根），
+    # 必须 > 发现延迟 + 判定窗口，否则爆发窗口会滑出回看范围造成漏推。
+    "deep_minutes": 30,
     "tg_proxy": None,
     "takeover_after": 600,
 }
@@ -138,6 +140,11 @@ async def main():
     # 上线 10 分钟内的新币绕过预筛直接评估，但共享 IP 下它们最吃配额，限量优先用预算
     fresh = fresh[:FRESH_EVAL_LIMIT]
     queue = hot + fresh
+    # 把预筛得到的 m5 作为「历史峰值」传给 evaluate_token：
+    # 若某币此刻量已回落但刚爆发过，仍要照常取分钟线，否则会漏推。
+    for k in queue:
+        if m5.get(k):
+            cands[k]["m5_peak"] = float(m5[k])
     log.info("候选 %d（热 %d，新币 %d→限 %d），预筛后 %d",
              len(todo), len(hot), len([k for k in todo if now - cands[k]["found"] <= bypass]),
              FRESH_EVAL_LIMIT, len(queue))
@@ -152,7 +159,8 @@ async def main():
             log.info("评估预算用尽（已推 %d，耗时 %ds），剩余候选留到下一轮", sent, int(time.time() - t_start))
             break
         try:
-            hit, info = bscvol.evaluate_token(k, cfg, now, deep_minutes=cfg["deep_minutes"])
+            hit, info = bscvol.evaluate_token(k, cfg, now, deep_minutes=cfg["deep_minutes"],
+                                               m5_peak=cands[k].get("m5_peak"))
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 # 共享 IP 撞到 Gecko 限流：立即停手，不再消耗配额，
