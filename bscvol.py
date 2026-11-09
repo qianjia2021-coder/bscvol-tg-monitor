@@ -558,10 +558,26 @@ def gh_repo(cfg):
     return f"https://api.github.com/repos/{g['owner']}/{g['repo']}/contents"
 
 
-def gh_get(cfg, token, path):
+def gh_get_raw(cfg, token, path):
+    """读取仓库中的任意文件，返回 (文本, sha)；文件不存在返回 (None, None)"""
     try:
         j = http_json(f"{gh_repo(cfg)}/{path}", headers=gh_headers(cfg, token), timeout=20)
-        return json.loads(base64.b64decode(j["content"]).decode("utf-8")), j["sha"]
+        return base64.b64decode(j["content"]).decode("utf-8"), j["sha"]
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None, None
+        raise
+    except Exception:
+        return None, None
+
+
+def gh_get(cfg, token, path):
+    """读取仓库中的 JSON 文件（bsc_vol_state.json 等），返回 (对象, sha)"""
+    try:
+        text, sha = gh_get_raw(cfg, token, path)
+        if text is None:
+            return None, None
+        return json.loads(text), sha
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None, None
