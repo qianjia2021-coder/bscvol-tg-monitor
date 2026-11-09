@@ -20,8 +20,8 @@ CFG_OVERRIDES = {
 STALE_SECONDS = 900            # 命中窗口结束超过 15 分钟就不补推（已无时效）
 DRY = os.environ.get("BSCVOL_DRY", "") == "1"
 SELFTEST = os.environ.get("VOL_SELFTEST", "") == "1"
-EVAL_BUDGET = 12               # 单次工作流最多评估多少个候选（受 10 分钟超时约束）
-EVAL_TIME_BUDGET = 420         # 单次工作流最多评估多少秒
+EVAL_BUDGET = 8                # 单次工作流最多评估多少个候选（受 5 分钟节拍与 10 分钟超时约束）
+EVAL_TIME_BUDGET = 240          # 单次工作流最多评估多少秒（实测 420s 会跑到 7.5 分钟，撑破节拍）
 
 
 async def tg_cloud_client(cfg):
