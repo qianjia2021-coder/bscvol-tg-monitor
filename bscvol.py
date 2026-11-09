@@ -127,6 +127,8 @@ def mark_pushed(state, token, detail, reason="strict"):
 def candidate_tier(cand, now, cfg):
     """候选优先级分层（数字越小越先评估）。
 
+    -1 接近达标        —— 已有单根分钟线 ≥ 阈值，只差连续根数；Gecko 结算
+                         后极可能立刻命中，最高优先级 + 高频复查
     0 热币 + Gecko 已收录     —— 最可能成立，立刻查
     1 热币 + 尚未收录         —— 币在放量，只是数据源还没跟上
     2 新币(10 分钟内) + 已收录 —— 绕过预筛，但可能还没放量
@@ -153,6 +155,10 @@ def candidate_tier(cand, now, cfg):
     if state == "old":
         # Gecko 收录的池子全部超过币龄上限，判定不可能成立，别再查
         return 5
+    if cand.get("near"):
+        # 已经有一根分钟线达到阈值，只差连续根数 —— 而 Gecko 的分钟线
+        # 要延迟几分钟才结算。此时它极可能马上命中，排到队首最高优先级。
+        return -1
     indexed = state == "ok"
     if hot and indexed:
         return 0
@@ -536,6 +542,26 @@ def evaluate_token(token, cfg, now_ts=None, deep_minutes=None, ignore_age=False,
     hit = detect([(k, v) for k, v in minutes.items()], now_ts,
                  cfg["threshold_usd"], cfg["need_consecutive"],
                  launch_ts=launch - (launch % 60))
+    # 「接近达标」信号：已经有单根分钟线 >= 阈值，但还没凑够连续 need 根。
+    #
+    # Gecko 的分钟线在结束后还要延迟几分钟才结算出最终值（实测约 3-5 分钟，
+    # 且会回填修正）。所以「单根已达标」的币极可能马上就会命中 ——
+    # 调度器据此把它排到队首并高频复查，可以显著缩短
+    # 「Gecko 结算完成 → 我们发现并推送」这段延迟。
+    th = float(cfg["threshold_usd"])
+    need = int(cfg.get("need_consecutive", 2))
+    done_minutes = [(ts, v) for ts, v in minutes.items() if ts % 60 == 0 and ts + 60 <= now_ts]
+    max_one = max((v for _, v in done_minutes), default=0.0)
+    # 连续达标根数的最大值（0 表示没有）
+    best_run = 0
+    run = 0
+    for i, (ts, v) in enumerate(sorted(done_minutes)):
+        if v >= th:
+            run += 1
+            best_run = max(best_run, run)
+        else:
+            run = 0
+    near = (not hit) and best_run > 0
     info = {
         "state": "hit" if hit else "watching",
         "pools": use,
@@ -548,6 +574,10 @@ def evaluate_token(token, cfg, now_ts=None, deep_minutes=None, ignore_age=False,
         "price": max(p["price"] for p in live),
         "name": use[0]["name"],
         "txns": use[0]["txns"],
+        "max_one": max_one,
+        "best_run": best_run,
+        "need": need,
+        "near": near,
     }
     return hit, info
 
@@ -968,7 +998,7 @@ async def run_local():
                 for k in due:
                     c = cands[k]
                     tier = candidate_tier(c, now, cfg)
-                    if tier >= 4 and tier not in (6, 7):
+                    if tier >= 4:
                         # tier4 既不热也不新；tier5 池子全老（超币龄上限）。
                         # 都不占 Gecko 配额，等下一轮预筛。
                         # 保留自身退避节奏（未收录的候选退避可能已达 900s），
@@ -977,7 +1007,10 @@ async def run_local():
                         c["next_check"] = now + tier4_wait(c)
                         continue
                     if budget <= 0:
-                        c["next_check"] = now + 12
+                        # 接近达标的币（tier -1）绝不能被预算挤掉 ——
+                        # 它已经有一根分钟线达到阈值，只差 Gecko 结算，
+                        # 跳过一轮就是多等一个复查周期。
+                        c["next_check"] = now + (6 if tier < 0 else 12)
                         continue
                     age = now - int(c.get("found", now))
                     if age < probe_min_age:
@@ -997,9 +1030,28 @@ async def run_local():
                                                    m5_peak=c.get("m5_peak"))
                     except Exception as e:
                         log.warning("评估失败 %s: %s", k, e)
+                        # 失败（多为代理 SSL EOF）不该按常规间隔等待 ——
+                        # 下一轮就重试，实测可省下 20 秒的窗口。
+                        # 但要限流，否则网络持续异常时会打爆 Gecko 配额。
+                        fail = int(c.get("fail_count", 0)) + 1
+                        c["fail_count"] = fail
+                        c["next_check"] = now + min(30, 5 * fail)
                         continue
+                    c["fail_count"] = 0
                     log.info("评估 %s -> %s m5=%.0f 分钟数=%d", k, info.get("state"),
                              info.get("m5") or 0, len(info.get("minutes") or {}))
+                    # 「接近达标」标记：已有单根分钟线 ≥ 阈值，只差连续根数。
+                    # Gecko 的分钟线结束后还要延迟几分钟才结算，此时它极可能
+                    # 马上命中 —— 排到队首并高频复查，能显著缩短推送延迟。
+                    if info.get("near"):
+                        c["near"] = True
+                        c["near_best"] = int(info.get("best_run") or 0)
+                        c["next_check"] = now + int(cfg.get("near_recheck_seconds", 12))
+                        log.info("  接近达标（已连续 %d/%d 根），%d 秒后复查",
+                                 c["near_best"], info.get("need"), c["next_check"] - now)
+                    else:
+                        c["near"] = False
+                        c["near_best"] = 0
                     # Gecko 的 m5 比 DexScreener 准（按池子聚合，更贴近链上）。
                     # 必须回写：否则 tier 分层永远用 DexScreener 的旧值，
                     # Gecko 已收录且 m5 很高的币会因 dex_m5=0 落到 tier4 永不评估。
