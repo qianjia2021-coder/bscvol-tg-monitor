@@ -35,5 +35,6 @@
  "prefilter_batch": 90,
  "min_probe_age_seconds": 120,
  "cloud_keepalive": true,
- "cloud_keepalive_max_gap": 900
+ "cloud_keepalive_max_gap": 900,
+ "deep_minutes": 30
 }
