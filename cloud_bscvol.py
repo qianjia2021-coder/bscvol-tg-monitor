@@ -59,17 +59,21 @@ async def main():
     log.info("本机心跳 %s（%s 秒前）", hb_keep, None if age is None else int(age))
 
     if SELFTEST:
-        client, functions = await tg_cloud_client(cfg)
-        me = await client.get_me()
-        entity = await bscvol.tg_ensure_target(client, functions, cfg, state)
-        await client.send_message(entity,
-                                  "【云端链路自检】登录成功：%s，目标群 %s"
-                                  % (getattr(me, "username", None) or me.id,
-                                     getattr(entity, "title", entity)),
-                                  parse_mode="html", link_preview=False)
+        bot = (cfg.get("bot_token") or os.environ.get("VOL_BOT_TOKEN") or "").strip()
+        client = functions = None
+        if not bot:
+            client, functions = await tg_cloud_client(cfg)
+            me = await client.get_me()
+            who = getattr(me, "username", None) or me.id
+        else:
+            who = "bot"
+        await bscvol.tg_send(client, functions, cfg, state,
+                             "【云端链路自检】登录成功：%s，目标群 %s"
+                             % (who, state.get("target_id")))
         log.info("自检消息已发送")
         print("SELFTEST OK")
-        await client.disconnect()
+        if client is not None:
+            await client.disconnect()
         return
 
     if age is not None and age < cfg["takeover_after"]:
@@ -113,10 +117,10 @@ async def main():
             log.info("[DRY] 会推送 %s %s", k, hit["vols"])
             print(text)
         else:
-            if client is None:
+            bot = (cfg.get("bot_token") or os.environ.get("VOL_BOT_TOKEN") or "").strip()
+            if client is None and not bot:
                 client, functions = await tg_cloud_client(cfg)
-            entity = await bscvol.tg_ensure_target(client, functions, cfg, state)
-            await client.send_message(entity, text, parse_mode="html", link_preview=False)
+            entity = await bscvol.tg_send(client, functions, cfg, state, text)
             sent += 1
         bscvol.mark_pushed(state, k, hit)
         log.info("推送 %s 窗口 %s vols=%s", k,
