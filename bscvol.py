@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -164,6 +165,32 @@ def detect_system_proxy():
 
 
 _opener = None
+
+
+def bot_api(token, method, payload=None, timeout=25, tries=3):
+    """Telegram Bot API：表单编码 POST（不是 JSON）"""
+    url = "https://api.telegram.org/bot%s/%s" % (token, method)
+    body = urllib.parse.urlencode(payload or {}).encode()
+    h = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": UA}
+    last = None
+    for attempt in range(tries):
+        try:
+            req = urllib.request.Request(url, data=body, headers=h, method="POST")
+            with opener().open(req, timeout=timeout) as r:
+                raw = r.read()
+                if r.headers.get("Content-Encoding") == "gzip":
+                    raw = gzip.GzipFile(fileobj=io.BytesIO(raw)).read()
+                return json.loads(raw)
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            try:
+                return json.loads(raw)
+            except Exception:
+                last = e
+        except Exception as e:
+            last = e
+        time.sleep(0.8 + attempt)
+    raise last
 
 
 def opener(proxy=None):
@@ -396,13 +423,11 @@ async def tg_ensure_target(client, functions, cfg, state):
 async def tg_send(client, functions, cfg, state, text):
     bot_token = (cfg.get("bot_token") or os.environ.get("VOL_BOT_TOKEN") or "").strip()
     if bot_token:
-        res = http_json(
-            "https://api.telegram.org/bot%s/sendMessage" % bot_token,
-            {"chat_id": state.get("target_id") or cfg["telegram"].get("chat_id"),
-             "text": text, "parse_mode": "html", "disable_web_page_preview": True},
-            timeout=25, method="POST")
+        res = bot_api(bot_token, "sendMessage",
+                      {"chat_id": state.get("target_id") or cfg["telegram"].get("chat_id"),
+                       "text": text, "parse_mode": "html", "disable_web_page_preview": "true"})
         if not res.get("ok"):
-            raise RuntimeError("Bot 发送失败: %s" % str(res)[:200])
+            raise RuntimeError("Bot 发送失败: %s" % str(res.get("description"))[:200])
         return None
     if client is None:
         raise RuntimeError("推送通道不可用（无 Bot Token 且用户会话失效）")
