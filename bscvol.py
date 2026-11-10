@@ -425,10 +425,32 @@ class Chain:
     def block_ts(self, n):
         return int(self.rpc("eth_getBlockByNumber", [hex(n), False])["timestamp"], 16)
 
-    def paircreated(self, from_block, to_block):
-        logs = self.rpc("eth_getLogs", [{
+    def _get_logs(self, from_block, to_block):
+        """取 PairCreated 日志；节点限制单次区块跨度时自动分片重试。
+
+        实测有节点返回 {"code": -32602, "message": "eth_getLogs is limited to
+        0 - 50 blocks range"}。原来把整段一次发出去，一旦轮转到这种节点，
+        异常会打断整个主循环（重启后需扫 6000 块时尤其必然触发）。
+        """
+        params = [{
             "fromBlock": hex(max(0, from_block)), "toBlock": hex(to_block),
-            "address": FACTORY_V2, "topics": [TOPIC_PAIRCREATED]}])
+            "address": FACTORY_V2, "topics": [TOPIC_PAIRCREATED]}]
+        try:
+            return self.rpc("eth_getLogs", params)
+        except Exception as e:
+            if "range" not in str(e).lower():
+                raise
+        out = []
+        step = 50
+        for start in range(max(0, from_block), to_block + 1, step):
+            end = min(start + step - 1, to_block)
+            out.extend(self.rpc("eth_getLogs", [{
+                "fromBlock": hex(start), "toBlock": hex(end),
+                "address": FACTORY_V2, "topics": [TOPIC_PAIRCREATED]}]))
+        return out
+
+    def paircreated(self, from_block, to_block):
+        logs = self._get_logs(from_block, to_block)
         return [parse_paircreated(lg) for lg in logs]
 
 
