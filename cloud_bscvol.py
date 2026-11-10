@@ -226,6 +226,17 @@ async def main():
             }
             stale_marked += 1
             continue
+        # 推送前复核一次：挡住 Gecko 在池子初生阶段的异常成交量（实测 2 亿 USD/分钟）
+        try:
+            hit2, _ = bscvol.evaluate_token(k, cfg, now, deep_minutes=cfg["deep_minutes"],
+                                            ignore_age=True, m5_peak=cands[k].get("m5_peak"))
+        except Exception as e:
+            log.warning("命中复核失败 %s: %s（本轮不推）", k, e)
+            hit2 = None
+        if not bscvol.push_guard(hit, hit2):
+            log.info("命中复核不一致，跳过 %s vols=%s 复核=%s", k,
+                     hit.get("vols"), (hit2 or {}).get("vols"))
+            continue
         text = bscvol.build_message(k, hit, info, cfg)
         # 接管途中本机若已恢复，云端让位：否则同一个命中会被本机与云端各推一次
         if token:
