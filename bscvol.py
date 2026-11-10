@@ -438,7 +438,10 @@ class Chain:
         try:
             return self.rpc("eth_getLogs", params)
         except Exception as e:
-            if "range" not in str(e).lower():
+            msg = str(e).lower()
+            # 跨度限制 与 部分节点对整段请求的 403 拒绝，都可以靠切小段绕过；
+            # 其它错误（网络断、方法不支持）照旧抛出去，不要用分片掩盖。
+            if "range" not in msg and "403" not in msg and "forbidden" not in msg:
                 raise
         out = []
         step = 50
