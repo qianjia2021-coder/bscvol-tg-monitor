@@ -459,8 +459,13 @@ GECKO = "https://api.geckoterminal.com/api/v2/networks/bsc"
 _GECKO_GAP = {"t": 0.0}
 
 
-def gecko_get(url, timeout=18):
-    """全局限速：两次请求至少间隔 2.5 秒；遇 429 冷却 25 秒再试一次"""
+def gecko_get(url, timeout=18, retry_delay=3):
+    """全局限速：两次请求至少间隔 2.5 秒；遇 429 冷却 25 秒再试一次。
+
+    代理偶发 SSL EOF / 超时与 429 不同：它不代表配额用尽，只是这条链路抖了一下，
+    实测一次抖动会导致该币当轮判决作废（近 20 分钟 38 次评估里 20 次失败）。
+    所以对这类瞬时错误额外重试一次（3 秒后），HTTP 错误原样抛出。
+    """
     for attempt in range(2):
         wait = 2.5 - (time.time() - _GECKO_GAP["t"])
         if wait > 0:
@@ -472,6 +477,11 @@ def gecko_get(url, timeout=18):
             if e.code == 429 and attempt == 0:
                 logging.warning("Gecko 限流，冷却 25 秒")
                 time.sleep(25)
+                continue
+            raise
+        except Exception:
+            if attempt == 0:
+                time.sleep(retry_delay)
                 continue
             raise
 
