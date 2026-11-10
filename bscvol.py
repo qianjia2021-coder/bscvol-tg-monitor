@@ -915,6 +915,33 @@ def should_push(cfg, state, token_key, log=None):
     return not is_pushed(state, k)
 
 
+MAX_MINUTE_USD = 5_000_000.0   # 单分钟成交额上限，超过即视为数据源异常
+
+
+def push_guard(hit, recheck, tol=1.5, max_usd=MAX_MINUTE_USD):
+    """命中后复核：两次独立读数一致、且量级可信，才允许推送。
+
+    Gecko 在池子刚创建那几分钟偶尔把成交量按 token 计量返回（实测 0xc8fa… 的
+    02:39 那根是 200,129,317，下一根却是 110,060），这种荒谬值一旦推出去，
+    用户会当成真实信号。复核不一致就暂缓，等下一轮回填修正后再判。
+    """
+    if not recheck:
+        return False
+    if int(hit.get("minute_start") or 0) != int(recheck.get("minute_start") or -1):
+        return False
+    vols1, vols2 = list(hit.get("vols") or []), list(recheck.get("vols") or [])
+    if len(vols1) != len(vols2) or not vols1:
+        return False
+    for a, b in zip(vols1, vols2):
+        a, b = float(a or 0), float(b or 0)
+        if a > max_usd or b > max_usd:
+            return False
+        hi, lo = max(a, b), min(a, b)
+        if lo <= 0 or hi / lo > tol:
+            return False
+    return True
+
+
 # ---------------------------------------------------------------- DexScreener 预筛
 DEX = "https://api.dexscreener.com/latest/dex/tokens/"
 
@@ -1170,6 +1197,20 @@ async def run_local():
                     c["gecko_state"] = "ok"
                     c["backoff_step"] = 0
                     if hit and should_push(cfg, state, k, log):
+                        # 推送前复核一次：挡住 Gecko 在池子初生阶段的异常成交量
+                        try:
+                            hit2, _ = evaluate_token(k, cfg, now,
+                                                     deep_minutes=cfg.get("deep_minutes"),
+                                                     ignore_age=True, m5_peak=c.get("m5_peak"))
+                        except Exception as e:
+                            log.warning("命中复核失败 %s: %s（本轮不推，下轮再判）", k, e)
+                            hit2 = None
+                        if not push_guard(hit, hit2):
+                            log.warning("命中复核不一致，暂缓推送 %s vols=%s 复核=%s", k,
+                                        hit.get("vols"), (hit2 or {}).get("vols"))
+                            c["next_check"] = now + int(cfg.get("near_recheck_seconds") or 12)
+                            save_state(state)
+                            continue
                         text = build_message(k, hit, info, cfg)
                         try:
                             await tg_send(client, functions, cfg, state, text)
